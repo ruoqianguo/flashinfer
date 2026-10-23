@@ -19,7 +19,8 @@ try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover
     from src.iket_compat import iket
-from cutlass.cute.nvgpu import warpgroup
+from cutlass.cute.nvgpu import cpasync, warpgroup
+import cutlass.pipeline as pipeline
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass.utils.hopper_helpers as sm90_utils
@@ -27,12 +28,18 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from moe_hopper_fp8.kernel_mxfp4_fp8_glu_fc12_swapab import (
     Sm90SwapABSwigluMxfp4Fp8Fc12Kernel,
 )
-from .nvfp4_policy import NVFP4_DEFAULT_CONVERSION, Nvfp4ConversionLayout
+from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
+from .nvfp4_policy import (
+    NVFP4_DEFAULT_CONVERSION,
+    Nvfp4ConversionLayout,
+    nvfp4_shared_memory_budget,
+)
 from .nvfp4_conversion import (
     nvfp4_get_lut,
     nvfp4_initialize_lut,
     convert_nvfp4_group,
     MXFP4_FOLD_BLOCK_BYTES,
+    MXFP4_FOLD_M,
     MXFP4_K_TILE,
     convert_packed_a_kblock,
     make_expanded_offset_view,
@@ -40,6 +47,7 @@ from .nvfp4_conversion import (
     make_offset_smem_layout,
     make_offset_smem_layout_k256,
     make_packed_a_ldsm_views_k256,
+    make_packed_a_ldsm_views_k256_half,
 )
 
 
@@ -51,6 +59,25 @@ def _keep_nvfp4_a_word_live(word, *, loc=None, ip=None):
         [word.ir_value(loc=loc, ip=ip)],
         "// NVFP4_A_LIVE_AFTER_WAIT $0",
         "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _prefetch_offset_bulk_l2(src_gmem, num_bytes, *, loc=None, ip=None):
+    """Warm L2 with folded offsets that a later cp.async stages into SMEM."""
+    llvm.inline_asm(
+        None,
+        [
+            src_gmem.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            num_bytes.ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -111,6 +138,360 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
             self.nvfp4_conversion,
         )
 
+    def _weight_aux_smem_layout_staged(self) -> cute.Layout:
+        stages = self._weight_sf_stage_count()
+        if self.mma_tiler[2] == 2 * MXFP4_K_TILE:
+            return make_offset_smem_layout_k256(self.mma_tiler[0], stages)
+        return make_offset_smem_layout(self.mma_tiler[0], stages)
+
+    def _weight_sf_decoupled(self) -> bool:
+        return self.nvfp4_conversion.sf_stages != 0
+
+    def _weight_sf_stage_count(self) -> int:
+        if self._weight_sf_decoupled():
+            return self.nvfp4_conversion.sf_stages
+        return self.num_ab_stage
+
+    def _weight_sf_lag(self, linear1: bool) -> int:
+        """AB stages by which a tile's scale copies trail its weight copies.
+
+        FC1 K256 keeps an AB slot until the next stage retires (two slots
+        held), FC2 releases it at the end of the stage (one slot). With this
+        lag the scale-slot wait ends no later than the next weight-slot wait
+        would, and the scales of a stage arrive one to 1.5 stages ahead of
+        use. The deadlock bound is lag <= num_ab_stage - held.
+        """
+        held = 2 if linear1 else 1
+        return max(0, self.num_ab_stage - held - self.nvfp4_conversion.sf_stages)
+
+    def _weight_sf_state(self, ab_state):
+        """Scale-ring consumer state for the AB stage ``ab_state`` points at.
+
+        The AB ring holds a whole number of scale-ring round trips (see
+        _compute_stages), so the scale slot and phase follow from the AB slot.
+        """
+        if not self._weight_sf_decoupled():
+            return ab_state
+        stages = self.nvfp4_conversion.sf_stages
+        shift = stages.bit_length() - 1
+        return pipeline.PipelineState(
+            stages,
+            ab_state.count,
+            ab_state.index & cutlass.Int32(stages - 1),
+            (ab_state.index >> cutlass.Int32(shift)) & cutlass.Int32(1),
+        )
+
+    def _validate_weight_sf_ring(self) -> None:
+        if not self._weight_sf_decoupled():
+            return
+        if (
+            self.mma_tiler[2] != 2 * MXFP4_K_TILE
+            or self.fp8_scale_mode != "mxfp4_hybrid"
+            or self.pingpong
+        ):
+            raise ValueError(
+                "nvfp4_sf_stages requires the hybrid K256 schedule without pingpong"
+            )
+
+    @cute.jit
+    def _prefetch_weight_scale_l2_k256(
+        self,
+        weight_sf_gemm: cute.Tensor,
+        work_tile_info,
+        k_tile,
+    ) -> None:
+        """Warm L2 with one K256 stage of scales (decoupled scale ring).
+
+        The stage's K128 pair is contiguous per M64 block, as in
+        _copy_weight_scale_bulk_k256; padded M64 blocks are skipped.
+        """
+        blocks = self.mma_tiler[0] // MXFP4_FOLD_M
+        bytes_per_block = 2 * MXFP4_FOLD_BLOCK_BYTES
+        with cute.arch.elect_one():
+            for block in cutlass.range_constexpr(blocks):
+                global_m64 = work_tile_info.tile_m_idx * cutlass.Int32(
+                    blocks
+                ) + cutlass.Int32(block)
+                gmem_iter = weight_sf_gemm.iterator + cute.crd2idx(
+                    (
+                        work_tile_info.expert_idx,
+                        global_m64,
+                        k_tile * cutlass.Int32(2),
+                        0,
+                        0,
+                    ),
+                    weight_sf_gemm.layout,
+                )
+                if cutlass.const_expr(self._weight_offset_m_padding_possible()):
+                    if global_m64 < weight_sf_gemm.shape[1]:
+                        _prefetch_offset_bulk_l2(
+                            gmem_iter, cutlass.Int32(bytes_per_block)
+                        )
+                else:
+                    _prefetch_offset_bulk_l2(gmem_iter, cutlass.Int32(bytes_per_block))
+
+    @cute.jit
+    def _tma_load_a_with_weight_sf_task_tile(
+        self,
+        tma_atom,
+        real_a: cute.Tensor,
+        desc_ptr_a,
+        sA: cute.Tensor,
+        weight_sf_gemm: cute.Tensor,
+        smem_weight_sf: cute.Tensor,
+        ab_producer,
+        weight_sf_producer,
+        work_tile_info,
+        tile_m_idx,
+        output_scale_block_base,
+        k_tile_cnt,
+        tidx,
+        tma_cta_coord,
+        tma_cta_layout,
+        mcast_mask,
+        _iket_active,
+    ):
+        gA_mkl = cute.local_tile(
+            real_a,
+            self._a_tma_tiler(),
+            (None, None, None),
+        )
+        sA_tma = self._a_tma_smem_tensor(sA)
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom,
+            tma_cta_coord,
+            tma_cta_layout,
+            cute.group_modes(sA_tma, 0, 2),
+            cute.group_modes(gA_mkl, 0, 2),
+        )
+        tAgA_slice = tAgA[(None, tile_m_idx, None, 0)]
+        ab_producer.reset()
+        weight_sf_producer.reset()
+        if cutlass.const_expr(self._weight_sf_decoupled()):
+            # Decoupled scale ring: iteration k issues the weights of stage k
+            # (and warms L2 with its scales), then stages the scales of stage
+            # k - lag; the last `lag` scale stages follow the weight loop.
+            lag = cutlass.Int32(self._weight_sf_lag(False))
+            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                lag = cutlass.Int32(self._weight_sf_lag(True))
+            peek_ab_empty_status = ab_producer.try_acquire()
+            for k_tile in cutlass.range(0, k_tile_cnt + lag, 1, unroll=1):
+                if k_tile < k_tile_cnt:
+                    ab_handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
+                    peek_ab_empty_status = cutlass.Boolean(1)
+                    if ab_handle.count + 1 < k_tile_cnt:
+                        peek_ab_empty_status = ab_producer.try_acquire()
+                    cute.copy(
+                        tma_atom,
+                        tAgA_slice[(None, ab_handle.count)],
+                        tAsA[(None, ab_handle.index)],
+                        tma_bar_ptr=ab_handle.barrier,
+                        tma_desc_ptr=desc_ptr_a,
+                        mcast_mask=mcast_mask,
+                    )
+                    self._prefetch_weight_scale_l2_k256(
+                        weight_sf_gemm, work_tile_info, ab_handle.count
+                    )
+                if k_tile >= lag:
+                    scale_handle = weight_sf_producer.acquire_and_advance()
+                    self._copy_weight_scale_cpasync_k256(
+                        weight_sf_gemm=weight_sf_gemm,
+                        smem_weight_sf=smem_weight_sf,
+                        work_tile_info=work_tile_info,
+                        output_scale_block_base=output_scale_block_base,
+                        scale_handle=scale_handle,
+                        tidx=tidx,
+                    )
+            return ab_producer, weight_sf_producer
+        peek_ab_empty_status = ab_producer.try_acquire()
+        peek_scale_empty_status = weight_sf_producer.try_acquire()
+        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+            if _iket_active:
+                iket.range_push("ab_producer_acquire")
+            ab_handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("weight_sf_producer_acquire")
+            scale_handle = weight_sf_producer.acquire_and_advance(
+                peek_scale_empty_status
+            )
+            if _iket_active:
+                iket.range_pop()
+            peek_ab_empty_status = cutlass.Boolean(1)
+            peek_scale_empty_status = cutlass.Boolean(1)
+            if ab_handle.count + 1 < k_tile_cnt:
+                peek_ab_empty_status = ab_producer.try_acquire()
+                peek_scale_empty_status = weight_sf_producer.try_acquire()
+            if _iket_active:
+                iket.range_push("tma_operand_copy")
+            cute.copy(
+                tma_atom,
+                tAgA_slice[(None, ab_handle.count)],
+                tAsA[(None, ab_handle.index)],
+                tma_bar_ptr=ab_handle.barrier,
+                tma_desc_ptr=desc_ptr_a,
+                mcast_mask=mcast_mask,
+            )
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("weight_sf_cpasync_copy")
+            if cutlass.const_expr(self.mma_tiler[2] == 2 * MXFP4_K_TILE):
+                self._copy_weight_scale_cpasync_k256(
+                    weight_sf_gemm=weight_sf_gemm,
+                    smem_weight_sf=smem_weight_sf,
+                    work_tile_info=work_tile_info,
+                    output_scale_block_base=output_scale_block_base,
+                    scale_handle=scale_handle,
+                    tidx=tidx,
+                )
+            else:
+                self._copy_weight_scale_cpasync(
+                    weight_sf_gemm=weight_sf_gemm,
+                    smem_weight_sf=smem_weight_sf,
+                    work_tile_info=work_tile_info,
+                    output_scale_block_base=output_scale_block_base,
+                    scale_handle=scale_handle,
+                    tidx=tidx,
+                )
+            if _iket_active:
+                iket.range_pop()
+        return ab_producer, weight_sf_producer
+
+    @cute.jit
+    def _mma_mxfp4_hybrid_fc2_k256_half(
+        self,
+        local_warp_idx: int,
+        tiled_mma,
+        packed_smem_a: cute.Tensor,
+        tCrB: cute.Tensor,
+        accumulators: cute.Tensor,
+        accum_temp: cute.Tensor,
+        ab_pipeline,
+        weight_sf_pipeline,
+        ab_consumer_state,
+        smem_activation_sf: cute.Tensor,
+        smem_weight_sf: cute.Tensor,
+        k_tile_cnt,
+        n_half,
+        tidx,
+    ):
+        """Run K256 FC2 with one short-lived converted K128 half."""
+
+        if local_warp_idx < self.epilogue_warps_per_warpgroup:
+            fp8_fragment_a = tiled_mma.make_fragment_A(
+                tiled_mma.partition_shape_A((self.wgmma_tile_m, MXFP4_K_TILE))
+            )
+            (
+                tiled_copy,
+                smem_partition,
+                copy_view,
+                packed_registers,
+            ) = make_packed_a_ldsm_views_k256_half(
+                tiled_mma,
+                packed_smem_a,
+                fp8_fragment_a,
+                tidx % cutlass.Int32(128),
+            )
+            expanded_offsets = make_expanded_offset_view_k256(
+                smem_weight_sf,
+                self.mma_tiler[0],
+            )
+            offsets_wg = cute.local_tile(
+                expanded_offsets,
+                cute.slice_(self.wgmma_tiler, (None, 0, None)),
+                (n_half, 0, None),
+            )
+            thr_mma = tiled_mma.get_slice(tidx % cutlass.Int32(128))
+            partitioned_offsets = thr_mma.partition_A(offsets_wg)
+
+            accumulators.fill(0.0)
+            for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                ab_pipeline.consumer_wait(ab_consumer_state)
+                # Without a decoupled scale ring this is ab_consumer_state itself.
+                sf_state = self._weight_sf_state(ab_consumer_state)
+                weight_sf_pipeline.consumer_wait(sf_state)
+                stage_idx = ab_consumer_state.index
+                sf_stage_idx = sf_state.index
+
+                for k128_half in cutlass.range_constexpr(2):
+                    for packed_k64 in cutlass.range_constexpr(2):
+                        cute.copy(
+                            tiled_copy,
+                            smem_partition[
+                                (
+                                    None,
+                                    None,
+                                    k128_half * 2 + packed_k64,
+                                    stage_idx,
+                                )
+                            ],
+                            copy_view[(None, None, packed_k64)],
+                        )
+
+                    for local_k64_group in cutlass.range_constexpr(2):
+                        local_k_block_begin = local_k64_group * 2
+                        global_k64_group = k128_half * 2 + local_k64_group
+                        global_k_block_begin = global_k64_group * 2
+                        scale_plane = cutlass.Int32(global_k64_group)
+                        convert_nvfp4_group(
+                            packed_registers,
+                            fp8_fragment_a,
+                            partitioned_offsets,
+                            local_k_block_begin + 0,
+                            global_k_block_begin + 0,
+                            (2) - (0),
+                            sf_stage_idx,
+                            smem_weight_sf,
+                            self.nvfp4_conversion,
+                        )
+                        if cutlass.const_expr(
+                            self._weight_sf_decoupled() and global_k64_group == 3
+                        ):
+                            # The stage's last scale read is done.
+                            weight_sf_pipeline.consumer_release(sf_state)
+
+                        tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
+                        warpgroup.fence()
+                        for k_offset in cutlass.range_constexpr(2):
+                            cute.gemm(
+                                tiled_mma,
+                                accum_temp,
+                                fp8_fragment_a[
+                                    (
+                                        None,
+                                        None,
+                                        local_k_block_begin + k_offset,
+                                    )
+                                ],
+                                tCrB[
+                                    (
+                                        None,
+                                        None,
+                                        global_k_block_begin + k_offset,
+                                        stage_idx,
+                                    )
+                                ],
+                                accum_temp,
+                            )
+                            tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                        warpgroup.commit_group()
+                        warpgroup.wait_group(0)
+                        self._promote_accum_temp_blockwise_streaming(
+                            accumulators=accumulators,
+                            accum_temp=accum_temp,
+                            smem_activation_sf=smem_activation_sf,
+                            stage_idx=stage_idx,
+                            scale_plane=scale_plane,
+                            tidx=tidx,
+                        )
+
+                if cutlass.const_expr(not self._weight_sf_decoupled()):
+                    weight_sf_pipeline.consumer_release(ab_consumer_state)
+                ab_pipeline.consumer_release(ab_consumer_state)
+                ab_consumer_state.advance()
+
+        return ab_consumer_state
+
     @cute.jit
     def _allocate_weight_aux_smem(self, smem, layout, tidx):
         storage = smem.allocate_tensor(
@@ -149,23 +530,21 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
             b_dtype,
             1,
         )
-        bytes_per_stage = (
-            cute.size_in_bytes(cutlass.Float4E2M1FN, a_layout)
-            + cute.size_in_bytes(b_dtype, b_layout)
-            + self._activation_sf_bytes_per_stage()
-            + self._weight_sf_bytes_per_stage()
+        self._validate_weight_sf_ring()
+        self.nvfp4_smem_budget = nvfp4_shared_memory_budget(
+            smem_capacity=smem_capacity,
+            occupancy=occupancy,
+            ab_data_bytes=(
+                cute.size_in_bytes(cutlass.Float4E2M1FN, a_layout)
+                + cute.size_in_bytes(b_dtype, b_layout)
+            ),
+            activation_sf_bytes=self._activation_sf_bytes_per_stage(),
+            weight_sf_bytes=self._weight_sf_bytes_per_stage(),
+            misc_bytes=self._smem_misc_budget_bytes(),
+            c_bytes_total=c_bytes_total,
+            conversion=self.nvfp4_conversion,
         )
-        fixed_overhead = (
-            self._smem_misc_budget_bytes()
-            + c_bytes_total
-            + self.nvfp4_conversion.lut_bytes
-        )
-        num_ab_stage = (smem_capacity // occupancy - fixed_overhead) // bytes_per_stage
-        if num_ab_stage < 2:
-            raise ValueError(
-                "Hopper NVFP4xFP8 requires at least two AB/offset stages; "
-                f"computed {num_ab_stage}."
-            )
+        num_ab_stage = self.nvfp4_smem_budget["num_ab_stage"]
         return 1, num_ab_stage, num_sched_stages
 
     # ------------------------------------------------------------------
@@ -225,10 +604,13 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
             if local_warp_idx == cutlass.Int32(0):
                 iket.range_push("mx_f1_wait0")
             ab_pipeline.consumer_wait(ab_consumer_state)
-            weight_sf_pipeline.consumer_wait(ab_consumer_state)
+            # Without a decoupled scale ring this is ab_consumer_state itself.
+            sf_state0 = self._weight_sf_state(ab_consumer_state)
+            weight_sf_pipeline.consumer_wait(sf_state0)
             if local_warp_idx == cutlass.Int32(0):
                 iket.range_pop()
             stage_idx = ab_consumer_state.index
+            sf_stage_idx0 = sf_state0.index
             cute.copy(
                 tiled_copy,
                 smem_partition[(None, None, None, stage_idx)],
@@ -243,7 +625,7 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
                 0,
                 0,
                 (4) - (0),
-                stage_idx,
+                sf_stage_idx0,
                 smem_weight_sf,
                 self.nvfp4_conversion,
             )
@@ -285,10 +667,13 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
                 4,
                 4,
                 (8) - (4),
-                stage_idx,
+                sf_stage_idx0,
                 smem_weight_sf,
                 self.nvfp4_conversion,
             )
+            if cutlass.const_expr(self._weight_sf_decoupled()):
+                # The stage's last scale read is done; free the scale slot.
+                weight_sf_pipeline.consumer_release(sf_state0)
             if cutlass.const_expr(self.nvfp4_fc1_k256_overlap):
                 if local_warp_idx == cutlass.Int32(0):
                     iket.range_push("mx_f1_wgwait0")
@@ -333,8 +718,10 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
 
             for k_tile in cutlass.range(1, k_tile_cnt, 1, unroll=1):
                 ab_pipeline.consumer_wait(ab_consumer_state)
-                weight_sf_pipeline.consumer_wait(ab_consumer_state)
+                sf_state = self._weight_sf_state(ab_consumer_state)
+                weight_sf_pipeline.consumer_wait(sf_state)
                 stage_idx = ab_consumer_state.index
+                sf_stage_idx = sf_state.index
                 cute.copy(
                     tiled_copy,
                     smem_partition[(None, None, None, stage_idx)],
@@ -347,7 +734,7 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
                     0,
                     0,
                     (4) - (0),
-                    stage_idx,
+                    sf_stage_idx,
                     smem_weight_sf,
                     self.nvfp4_conversion,
                 )
@@ -373,10 +760,12 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
                     4,
                     4,
                     (8) - (4),
-                    stage_idx,
+                    sf_stage_idx,
                     smem_weight_sf,
                     self.nvfp4_conversion,
                 )
+                if cutlass.const_expr(self._weight_sf_decoupled()):
+                    weight_sf_pipeline.consumer_release(sf_state)
                 if cutlass.const_expr(self.nvfp4_fc1_k256_overlap):
                     warpgroup.wait_group(0)
                     # RS A registers remain asynchronous WGMMA operands until wait.
@@ -402,7 +791,8 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
                     )
                 warpgroup.commit_group()
                 warpgroup.wait_group(0)
-                weight_sf_pipeline.consumer_release(release_state)
+                if cutlass.const_expr(not self._weight_sf_decoupled()):
+                    weight_sf_pipeline.consumer_release(release_state)
                 ab_pipeline.consumer_release(release_state)
                 release_state.advance()
                 ab_consumer_state.advance()
@@ -423,7 +813,8 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
                 scale_plane=cutlass.Int32(0),
                 tidx=tidx,
             )
-            weight_sf_pipeline.consumer_release(release_state)
+            if cutlass.const_expr(not self._weight_sf_decoupled()):
+                weight_sf_pipeline.consumer_release(release_state)
             ab_pipeline.consumer_release(release_state)
 
         return ab_consumer_state

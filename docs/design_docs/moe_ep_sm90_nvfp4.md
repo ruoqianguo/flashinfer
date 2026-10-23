@@ -149,3 +149,32 @@ five attempts retain the first block passing the rank-skew rule. Three rounds
 in one process are not three independent fresh-process runs. Use separate
 `torchrun` processes to measure process-to-process variation, and account for
 actual GPU clock and power states when interpreting results.
+
+## Two-slot scale ring
+
+`nvfp4_sf_stages=0` follows the AB pipeline's scale-buffer stage count.
+Eligible non-pingpong M256N64K256 tactics can instead use
+`nvfp4_sf_stages=2`, `compact_pull_buffer=True`, lane LUT mapping, and one
+or two LUT replicas. Two scale slots reduce shared-memory use; the supplied
+profiles use four AB stages. The AB and scale-ring barriers use their own
+slot counts. This changes buffering, not the numerical operation: same-core
+sf0/sf2 output remains byte-identical.
+
+The tuning table includes five SF2 profiles: R1/R2 at T512 and T1024, and
+one R1 profile at T2048. Capacity defaults and runtime autotuning select
+profiles differently:
+
+- **Capacity defaults:** initialization uses `max_tokens_per_rank` in the
+  exact thirteen-capacity H200/model/routing domain above. T512/T1024 use
+  R1 SF2 profiles; the other eleven defaults use SF0. Default selection does
+  not require the live token count to equal capacity: capacity512 with live8
+  may select the capacity512 SF2 profile. Unmatched capacity, model, or
+  hardware uses the legal fallback. Defaults do not add live-token dispatch.
+- **Runtime autotuning and cache:** SF2 selection additionally requires a
+  known live token count equal to capacity and effective FC1 K256 overlap
+  enabled in the model/hardware/routing domain above. Unknown or mismatched
+  live counts exclude SF2 from these paths.
+
+A complete manual tactic can set `"nvfp4_sf_stages": 2`. Its shape, resource,
+and numerical requirements still apply independently of the default and
+autotuning selection rules.
