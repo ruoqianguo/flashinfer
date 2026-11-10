@@ -42,10 +42,20 @@ TOKEN_COUNTS = (
     200,
     256,
     400,
+    448,
+    449,
+    480,
+    496,
     512,
+    513,
     777,
     1024,
     1025,
+    2016,
+    2017,
+    2048,
+    2240,
+    2241,
     3000,
     4096,
     8192,
@@ -67,7 +77,7 @@ def _skip_unless_sm120():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("num_sms", [48, 110, 170, 188])
+@pytest.mark.parametrize("num_sms", [48, 84, 110, 170, 188])
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_schedule_invariants(num_sms, deterministic):
     for num_experts in (96, 128, 256, 260, 384, 512, 1024):
@@ -77,6 +87,11 @@ def test_schedule_invariants(num_sms, deterministic):
                 255,
                 256,
                 257,
+                448,
+                449,
+                480,
+                512,
+                513,
                 1000,
                 1024,
                 1025,
@@ -773,3 +788,31 @@ def test_rejects_misplaced_or_misaligned_buffers():
     shifted = torch.empty(scratch.numel() + 1, device="cuda")[1:].view(scratch.shape)
     with pytest.raises(ValueError, match="16-byte aligned"):
         prepare_mega_gate(x, weight, 6, bias=bias, scratch=shifted)
+
+
+@pytest.mark.cpu_only
+def test_84sm_measured_window_preserves_determinism():
+    for tokens in (448, 449, 480, 512, 513):
+        config = heuristics.select_config(tokens, 5120, 384, 84)
+        assert config.num_ctas(tokens, 84) <= 84
+        if 449 <= tokens <= 512:
+            assert config.block_tokens == 96
+            assert config.num_split_k == 4
+            assert config.num_token_blocks(tokens) <= config.num_worker_groups(
+                tokens, 84
+            )
+        deterministic = heuristics.select_config(tokens, 5120, 384, 84, True)
+        assert deterministic.num_split_k == 1
+
+
+@pytest.mark.cpu_only
+def test_84sm_prefill_window_preserves_determinism():
+    for tokens in (2016, 2017, 2048, 2240, 2241):
+        config = heuristics.select_config(tokens, 5120, 384, 84)
+        assert config.num_ctas(tokens, 84) <= 84
+        if 2017 <= tokens <= 2240:
+            assert (config.block_tokens, config.num_split_k) == (64, 4)
+        else:
+            assert config.block_tokens == 96
+        deterministic = heuristics.select_config(tokens, 5120, 384, 84, True)
+        assert deterministic.num_split_k == 1

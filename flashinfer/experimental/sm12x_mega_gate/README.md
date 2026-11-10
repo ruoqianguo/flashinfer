@@ -130,3 +130,17 @@ Do not use one plan concurrently across streams.
 pytest tests/experimental/test_mega_gate_sm12x.py -q
 python benchmarks/bench_mega_gate_sm12x.py --cupti
 ```
+
+### RTX 5080 validation
+
+The 84-SM RTX 5080 passes the correctness matrix. For the 5120-hidden,
+384-expert router, non-deterministic calls with 449-512 tokens use a measured
+96-token, split-K-4 schedule. This avoids the extra wave of the narrow-block
+schedule, reducing CUPTI device time by about 16% at 480 and 512 tokens.
+The override is scoped to this effective SM count and shape; smaller calls,
+other shapes and deterministic calls retain their existing policies.
+
+A second measured window uses 64-token blocks with split-K 4 for 2017-2240
+tokens on the same 84-SM, 5120-hidden, 384-expert shape, reducing device time
+by about 7%. Boundary measurements at 2016 and 2241 tokens favor the original
+policy, so neither is included.

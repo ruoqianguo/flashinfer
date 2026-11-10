@@ -179,6 +179,18 @@ MEASURED_SPLITS: dict[tuple[int, int, int], tuple[tuple[int, int], ...]] = {
 }
 
 
+# Narrow measured schedule windows: (effective SMs, hidden, experts) ->
+# (first token count, last token count, block tokens, split-K). On RTX 5080,
+# 449-512 tokens exceed one wave of 64-token blocks; a 96-token block avoids
+# that turnaround (about 16% less device time at 480/512 tokens, CUPTI).
+# At 2017-2240 tokens, 64-token blocks with split-K 4 also outperform the
+# model's split-K-1 schedule by about 7%. Beyond 2240 another wave reverses
+# that gain. Deterministic calls bypass these measured windows.
+MEASURED_CONFIGS = {
+    (84, 5120, 384): ((449, 512, 96, 4), (2017, 2240, 64, 4)),
+}
+
+
 def one_wave_block_tokens(
     num_tokens: int, num_groups: int, num_sms: int, split: int
 ) -> int | None:
@@ -341,6 +353,11 @@ def select_config(
     num_tokens = max(num_tokens, 1)
 
     if not deterministic:
+        for first, last, block, split in MEASURED_CONFIGS.get(
+            (num_sms, hidden, num_experts), ()
+        ):
+            if first <= num_tokens <= last:
+                return make_config(block, split, num_experts)
         for max_tokens, split in MEASURED_SPLITS.get(
             (num_sms, hidden, num_experts), ()
         ):
